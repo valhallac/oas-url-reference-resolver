@@ -29,7 +29,8 @@ def process_reference(ref, output_folder, is_main_file):
     """Recursively process $ref in the Swagger file."""
     if ref.startswith("http"):
         # Download and update the dependency file
-        download_url = ref.replace("http://127.0.0.1:10000", "https://developer-specs.company-information.service.gov.uk")
+        #Optional url replace
+        #download_url = ref.replace("http://127.0.0.1:10000", "https://developer-specs.company-information.service.gov.uk")
         dependency_path = download_file(download_url, output_folder)
 
         # Extract JSON filename from the original URL for relative path
