@@ -1,110 +1,102 @@
-import os
 import json
+import os
 import requests
-from queue import Queue
 from urllib.parse import urlparse
 
-def download_file(url, folder_path):
-    """Download a file from the given URL and save it to the specified folder."""
-    # Extract JSON filename from the URL
-    json_filename = os.path.basename(urlparse(url).path)
-    file_path = os.path.join(folder_path, json_filename)
+def download_file(url, local_filename):
+    if not os.path.exists(local_filename):
+        with requests.get(url, stream=True) as response:
+            with open(local_filename, 'wb') as file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    file.write(chunk)
 
-    # Skip download if the file already exists
-    if os.path.exists(file_path):
-        print(f"File '{json_filename}' already exists. Skipping download.")
-    else:
-        response = requests.get(url)
-        if response.status_code == 200:
-            with open(file_path, 'wb') as file:
-                file.write(response.content)
-            print(f"File '{json_filename}' downloaded successfully.")
-            queue.put(file_path)
-        else:
-            raise Exception(f"Failed to download file from {url}. Status code: {response.status_code}")
+def update_refs_with_local_dependency(openapi_file, local_folder):
+    with open(openapi_file, 'r') as file:
+        spec = json.load(file)
 
-    return file_path
+    update_refs_in_paths(spec, local_folder)
+    update_refs_in_responses(spec, local_folder)
+    update_refs_in_request_bodies(spec, local_folder)
 
-def process_reference(ref, output_folder, is_main_file):
-    """Recursively process $ref in the Swagger file."""
-    if ref.startswith("http"):
-        # Download and update the dependency file
-        #Optional url replace
-        #download_url = ref.replace("http://127.0.0.1:10000", "https://developer-specs.company-information.service.gov.uk")
-        dependency_path = download_file(download_url, output_folder)
+    with open(openapi_file, 'w') as file:
+        json.dump(spec, file, indent=2)
 
-        # Extract JSON filename from the original URL for relative path
-        original_filename = os.path.basename(urlparse(ref).path)
-        
-        # Calculate relative path from the current folder
-        relative_path = os.path.relpath(dependency_path, output_folder)
-        
-        # Append # part from the original URL
-        fragment = urlparse(ref).fragment
-        ref_path = f"{relative_path}#{fragment}"
+def update_refs_in_paths(spec, local_folder):
+    for path, definition in find_refs(spec.get('paths', {})):
+        update_ref(definition, local_folder)
 
-        if is_main_file is False:
-            return ref_path.replace(os.sep, "/")  # Ensure consistent file paths for all operating systems
-        else:
-            ref_path = f"/local_dependencies/{ref_path}"
-            return ref_path.replace(os.sep, "/")
-    else:
-        return ref
+def update_refs_in_responses(spec, local_folder):
+    responses = spec.get('components', {}).get('responses', {})
+    for response_name, response_def in responses.items():
+        for path, definition in find_refs(response_def):
+            update_ref(definition, local_folder)
 
-def traverse(obj, output_folder):
-    """Traverse the Swagger file and update $ref with http prefix."""
+def update_refs_in_request_bodies(spec, local_folder):
+    request_bodies = spec.get('components', {}).get('requestBodies', {})
+    for body_name, body_def in request_bodies.items():
+        for path, definition in find_refs(body_def):
+            update_ref(definition, local_folder)
+
+def update_ref(definition, local_folder):
+    url = definition.get('$ref')
+    if url:
+        modified_url = modify_url(url)
+        filename = urlparse(modified_url).path.rsplit('/', 1)[-1]
+
+        local_path = os.path.join(local_folder, filename)
+        download_file(modified_url, local_path)
+        definition['$ref'] = f"local_dependencies/{filename}"
+
+        update_local_dependency(local_path, local_folder)
+
+def update_local_dependency(local_path, local_folder):
+    with open(local_path, 'r') as file:
+        dependency_spec = json.load(file)
+
+    for path, definition in find_refs(dependency_spec):
+        url = definition.get('$ref')
+        if url:
+            modified_url = modify_url(url)
+            filename = urlparse(modified_url).path.rsplit('/', 1)[-1]
+
+            dependency_local_path = os.path.join(local_folder, filename)
+
+            # Check if the nested file already exists in local dependencies
+            if not os.path.exists(dependency_local_path):
+                download_file(modified_url, dependency_local_path)
+                definition['$ref'] = f"local_dependencies/{filename}"
+
+                update_local_dependency(dependency_local_path, local_folder)
+
+    with open(local_path, 'w') as file:
+        json.dump(dependency_spec, file, indent=2)
+
+def modify_url(url):
+    if "http://127.0.0.1:10000" in url:
+        return url.replace("http://127.0.0.1:10000", "https://developer-specs.company-information.service.gov.uk")
+    return url
+
+def find_refs(obj, path=''):
     if isinstance(obj, dict):
         for key, value in obj.items():
-            if key == "$ref" and value.startswith("http"):
-                # Process $ref if it starts with http
-                obj[key] = process_reference(value, output_folder, is_main_file)
-            elif isinstance(value, (dict, list)):
-                # Recursively traverse nested dictionaries and lists
-                traverse(value, output_folder)
+            if key == '$ref':
+                yield path, obj
+            else:
+                yield from find_refs(value, f"{path}/{key}")
 
-def process_swagger_file(swagger_file_path, output_folder, is_main_file):
-    """Process Swagger file, download and update dependencies, and save the modified Swagger file."""
-    with open(swagger_file_path, 'r') as file:
-        swagger_data = json.load(file)
-
-    # Create a folder for local dependencies if it does not exist
-    os.makedirs(output_folder, exist_ok=True)
-
-    # Traverse the entire Swagger file
-    traverse(swagger_data, output_folder)
-
-    # Modify Swagger file to replace specific URL prefixes
-    for path, path_data in swagger_data.get("paths", {}).items():
-        for method, method_data in path_data.items():
-            if "$ref" in method_data and method_data["$ref"].startswith("http"):
-                method_data["$ref"] = process_reference(method_data["$ref"], output_folder, is_main_file)
-
-    # Save the modified Swagger file
-    with open(swagger_file_path, 'w') as output_file:
-        json.dump(swagger_data, output_file, indent=2)
-
-    return swagger_file_path
+    elif isinstance(obj, list):
+        for i, element in enumerate(obj):
+            yield from find_refs(element, f"{path}/{i}")
 
 if __name__ == "__main__":
-    try:
-        # Get the directory of the script
-        script_directory = os.path.dirname(os.path.realpath(__file__))
+    openapi_file = "your_openapi_file.json"
+    local_folder = "local_dependencies"
 
-        # Construct the full path to the Swagger file
-        swagger_file_path = os.path.join(script_directory, "swaggerfile.json")
+    script_path = os.path.dirname(os.path.abspath(__file__))
+    openapi_file_path = os.path.join(script_path, openapi_file)
+    local_folder_path = os.path.join(script_path, local_folder)
 
-        # Output folder
-        output_folder = os.path.join(script_directory, "local_dependencies")
+    if not os.path.exists(local_folder_path):
+        os.makedirs(local_folder_path)
 
-        queue = Queue()
-        queue.put(swagger_file_path)
-        is_main_file = True
-        while not queue.empty():
-            current_swagger_path = queue.get()
-            # Process Swagger file
-            modified_swagger_path = process_swagger_file(current_swagger_path, output_folder, is_main_file)
-            print(f"Swagger file processed successfully: {modified_swagger_path}")
-            is_main_file = False
-
-    except Exception as e:
-        print(f"Error: {str(e)}")
+    update_refs_with_local_dependency(openapi_file_path, local_folder_path)
